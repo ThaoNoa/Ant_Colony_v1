@@ -1,32 +1,21 @@
 /**
- * app.js — Orchestrator chính v3
+ * app.js — SmartRoute v3 WebSocket Client
  *
- * Hỗ trợ 2 chế độ AI:
- *   'ql'   — Q-Learning (3 state × 3 action, tabular) — logic gốc
- *   'ddpg' — DDPG (state vector 10D, continuous alpha/rho)
- *
- * Switch mode bằng nút "btn-mode-switch" trên header.
+ * Thay thế toàn bộ logic AI (aco.js, qlearning.js, ddpg_agent.js, ...)
+ * Chỉ còn:
+ *   - WebSocket connection tới Python backend
+ *   - Nhận JSON mỗi generation → render Canvas + cập nhật UI
+ *   - Gửi lệnh user (button clicks) lên backend
  */
 
-import { Graph }          from './graph.js';
-import { ACOEngine }      from './aco.js';
-import { QLearningAgent, STATE_LABELS, ACTION_PARAMS, STATES } from './qlearning.js';
-import { TSPEnvironment } from './environment.js';
-import { DDPGAgent }      from './ddpg_agent.js';
-import { Renderer }       from './renderer.js';
-import { ChartManager }   from './chart_manager.js';
-import { HeadlessTrainer } from './trainer.js';
-import { Evaluator }       from './evaluator.js';
+import { Renderer }     from './renderer.js';
+import { ChartManager } from './chart_manager.js';
 
 // =====================================================================
 // CONSTANTS
 // =====================================================================
-const NUM_NODES     = 20;
-const NUM_ANTS      = 30;
-const MS_PER_GEN    = 120;
-const PARTICLE_RATE = 3;
+const WS_URL = `ws://${location.host}/ws`;
 
-// State feature labels (cho DDPG state vector display)
 const STATE_FEATURE_LABELS = [
   'Cost norm', 'Improve rate', 'Stuck norm',
   'Avg phero', 'Std phero', 'Blocked ratio',
@@ -34,335 +23,269 @@ const STATE_FEATURE_LABELS = [
 ];
 
 // =====================================================================
-// APP STATE
-// =====================================================================
-let graph    = null;
-let aco      = null;
-let renderer = null;
-let chartMgr = null;
-
-// Q-Learning mode
-let qlAgent  = null;
-
-// DDPG mode
-let ddpgAgent = null;
-let env       = null;
-
-// Shared simulation state
-let mode        = 'ql';       // 'ql' | 'ddpg'
-let isRunning   = false;
-let isBlockTool = false;
-let generation  = 0;
-let bestPath    = null;
-let bestCost    = Infinity;
-let loopHandle  = null;
-let isProcessingGen = false; // Ngăn chặn chồng chéo async (chống đơ)
-
-// DDPG train cadence
-let genSinceLastTrain = 0;
-
-// =====================================================================
 // DOM ELEMENTS
 // =====================================================================
-const mainCanvas      = document.getElementById('main-canvas');
-const btnStartPause   = document.getElementById('btn-start-pause');
-const btnBlockTool    = document.getElementById('btn-block-tool');
-const btnReset        = document.getElementById('btn-reset');
-const btnModeSwitch   = document.getElementById('btn-mode-switch');
+const mainCanvas     = document.getElementById('main-canvas');
+const btnStartPause  = document.getElementById('btn-start-pause');
+const btnBlockTool   = document.getElementById('btn-block-tool');
+const btnClearTraffic= document.getElementById('btn-clear-traffic');
+const btnReset       = document.getElementById('btn-reset');
+const btnModeSwitch  = document.getElementById('btn-mode-switch');
+const btnTrainFast   = document.getElementById('btn-train-fast');
+const btnExportModel = document.getElementById('btn-export-model');
+const btnImportModel = document.getElementById('btn-import-model');
+const btnRunTestSuite= document.getElementById('btn-run-test-suite');
+const fileImportPt   = document.getElementById('file-import-pt');
 
 // Shared UI
-const elGenNum        = document.getElementById('gen-number');
-const elBestDist      = document.getElementById('best-dist');
-const elAlpha         = document.getElementById('param-alpha');
-const elRho           = document.getElementById('param-rho');
-const elEpsilon       = document.getElementById('param-epsilon');
+const elGenNum   = document.getElementById('gen-number');
+const elBestDist = document.getElementById('best-dist');
+const elAlpha    = document.getElementById('param-alpha');
+const elRho      = document.getElementById('param-rho');
+const elEpsilon  = document.getElementById('param-epsilon');
+const elAlgoLabel= document.getElementById('algo-label');
 
 // Q-Learning panel
-const qlPanel         = document.getElementById('ql-panel');
-const elStateLabel    = document.getElementById('state-label');
-const elStateBadge    = document.getElementById('state-badge');
-const elAction        = document.getElementById('current-action');
-const elReward        = document.getElementById('last-reward');
-const elQTable        = document.getElementById('qtable-display');
+const qlPanel       = document.getElementById('ql-panel');
+const elStateLabel  = document.getElementById('state-label');
+const elStateBadge  = document.getElementById('state-badge');
+const elAction      = document.getElementById('current-action');
+const elReward      = document.getElementById('last-reward');
+const elQTable      = document.getElementById('qtable-display');
 
 // DDPG panel
-const ddpgPanel       = document.getElementById('ddpg-panel');
-const elGaugeAlpha    = document.getElementById('gauge-alpha');
-const elGaugeRho      = document.getElementById('gauge-rho');
-const elValAlpha      = document.getElementById('val-alpha');
-const elValRho        = document.getElementById('val-rho');
-const elCriticLoss    = document.getElementById('critic-loss');
-const elActorLoss     = document.getElementById('actor-loss');
-const elBufferFill    = document.getElementById('buffer-fill');
-const elOuNoise       = document.getElementById('ou-noise');
-const elDdpgReward    = document.getElementById('ddpg-reward');
-const elStateVec      = document.getElementById('state-vec-display');
+const ddpgPanel     = document.getElementById('ddpg-panel');
+const elGaugeAlpha  = document.getElementById('gauge-alpha');
+const elGaugeRho    = document.getElementById('gauge-rho');
+const elValAlpha    = document.getElementById('val-alpha');
+const elValRho      = document.getElementById('val-rho');
+const elCriticLoss  = document.getElementById('critic-loss');
+const elActorLoss   = document.getElementById('actor-loss');
+const elBufferFill  = document.getElementById('buffer-fill');
+const elOuNoise     = document.getElementById('ou-noise');
+const elDdpgReward  = document.getElementById('ddpg-reward');
+const elStateVec    = document.getElementById('state-vec-display');
 
-// Header badge
-const elAlgoLabel     = document.getElementById('algo-label');
-
-// DOM - New Action Buttons
-const btnTrainFast    = document.getElementById('btn-train-fast');
-const btnExportModel  = document.getElementById('btn-export-model');
-const btnImportModel  = document.getElementById('btn-import-model');
-const btnRunTestSuite = document.getElementById('btn-run-test-suite');
-const fileImportJson  = document.getElementById('file-import-json');
-const fileImportBin   = document.getElementById('file-import-bin');
-const btnClearTraffic = document.getElementById('btn-clear-traffic');
-
-// DOM - Test Suite Modal
-const testModal       = document.getElementById('test-modal');
-const btnCloseModal   = document.getElementById('btn-close-modal');
-const testTableBody   = document.getElementById('test-table-body');
-let testCompareChart  = null;
+// Test Suite Modal
+const testModal    = document.getElementById('test-modal');
+const btnCloseModal= document.getElementById('btn-close-modal');
+const testTableBody= document.getElementById('test-table-body');
+let testCompareChart = null;
 
 // =====================================================================
-// INITIALIZATION
+// APP STATE
 // =====================================================================
-function init() {
-  resizeCanvas();
-  if (chartMgr) chartMgr.destroy();
+let renderer = null;
+let chartMgr = null;
+let ws       = null;
 
-  graph    = new Graph(NUM_NODES, mainCanvas.width, mainCanvas.height);
-  aco      = new ACOEngine(graph, { numAnts: NUM_ANTS });
-  renderer = new Renderer(mainCanvas);
-  chartMgr = new ChartManager('line-chart');
+let isRunning   = false;
+let isBlockTool = false;
+let mode        = 'ql';
 
-  graph.generate();
-  chartMgr.initialize();
+// Virtual graph object (populated from server data, fed to renderer.js)
+let vGraph = null;
+let bestPath = null;
+let bestCost = Infinity;
+let generation = 0;
 
-  generation = 0;
-  bestPath   = null;
-  bestCost   = Infinity;
-  genSinceLastTrain = 0;
-
-  // Init agents
-  qlAgent = new QLearningAgent();
-
-  if (mode === 'ddpg') {
-    env = new TSPEnvironment(graph, aco);
-    env.reset();
-    if (ddpgAgent) ddpgAgent.resetNoise();
-  }
-
-  renderer.render(graph, bestPath, { generation, bestCost: 0 });
-
-  if (mode === 'ql') {
-    updateUIQL({ state: STATES.IMPROVING, action: 0, params: ACTION_PARAMS[0], reward: 0, epsilon: qlAgent.epsilon });
-  } else {
-    updateUIDDPG({ alpha: 1.0, rho: 0.1, reward: 0, trainInfo: null, stateVec: null });
-  }
-
-  setBlockToolActive(false);
-  console.log('[App] Init:', NUM_NODES, 'nodes,', NUM_ANTS, 'ants, mode:', mode);
+// =====================================================================
+// VIRTUAL GRAPH — bridge between server JSON and renderer.js
+// =====================================================================
+function createVirtualGraph(data) {
+  if (!data) return vGraph; // Keep old
+  // Map Python snake_case → JS camelCase for renderer.js compatibility
+  const nodes = (data.nodes || []).map(n => ({
+    ...n,
+    isDepot: n.is_depot ?? n.isDepot ?? false,
+  }));
+  return {
+    nodes,
+    pheromones:   data.pheromones || [],
+    blockedEdges: new Set(data.blocked_edges || []),
+    size:         data.size || nodes.length,
+    isEdgeBlocked(i, j) {
+      const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+      return this.blockedEdges.has(key);
+    },
+    distances: data.distances || [],
+    costs:     data.costs     || [],
+  };
 }
 
 // =====================================================================
-// SIMULATION LOOP — DISPATCH
+// WEBSOCKET
 // =====================================================================
-async function runGeneration() {
-  if (!isRunning || isProcessingGen) return;
-  isProcessingGen = true;
+function connectWS() {
+  ws = new WebSocket(WS_URL);
 
-  try {
-    if (mode === 'ql') {
-      runGenerationQL();
-    } else {
-      await runGenerationDDPG();
+  ws.onopen = () => {
+    console.log('[WS] Connected to Python backend');
+    showToast('🔌 Đã kết nối server!');
+  };
+
+  ws.onmessage = (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+    handleServerMessage(msg);
+  };
+
+  ws.onclose = () => {
+    showToast('⚠️ Mất kết nối server — thử kết nối lại sau 2s...');
+    setTimeout(connectWS, 2000);
+  };
+
+  ws.onerror = (err) => {
+    console.error('[WS] Error:', err);
+  };
+}
+
+function send(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+// =====================================================================
+// SERVER MESSAGE HANDLER
+// =====================================================================
+function handleServerMessage(msg) {
+  switch (msg.type) {
+
+    case 'init':
+      vGraph     = createVirtualGraph(msg.graph);
+      mode       = msg.mode || 'ql';
+      generation = 0;
+      bestPath   = null;
+      bestCost   = Infinity;
+      applyModeUI(mode);
+      renderFrame();
+      break;
+
+    case 'gen_update':
+      generation = msg.generation ?? generation;
+      bestPath   = msg.best_path  ?? null;
+      bestCost   = msg.best_cost  ?? Infinity;
+      if (msg.graph) vGraph = createVirtualGraph(msg.graph);
+
+      // Update chart
+      const dist = (bestCost != null && bestCost < 1e9) ? bestCost : 0;
+      const reward = (msg.ql?.reward ?? msg.ddpg?.reward ?? 0);
+      if (chartMgr) chartMgr.addDataPoint(generation, dist, reward);
+
+      // Update UI
+      if (msg.mode === 'ql' && msg.ql) updateUIQL(msg.ql);
+      else if (msg.mode === 'ddpg' && msg.ddpg) updateUIDDPG(msg.ddpg);
+
+      renderFrame();
+      break;
+
+    case 'mode_switch':
+      mode = msg.mode || 'ql';
+      applyModeUI(mode);
+      if (chartMgr) chartMgr.reset();
+      generation = 0;
+      bestPath   = null;
+      bestCost   = Infinity;
+      if (elGenNum)   elGenNum.textContent  = '0';
+      if (elBestDist) elBestDist.textContent = '—';
+      break;
+
+    case 'toast':
+      showToast(msg.message || '');
+      break;
+
+    case 'train_start':
+      if (btnTrainFast) {
+        btnTrainFast.disabled    = true;
+        btnTrainFast.textContent = '⏳ Đang train...';
+      }
+      break;
+
+    case 'train_progress':
+      if (elGenNum)   elGenNum.textContent  = msg.gen ?? '—';
+      if (elBestDist) {
+        elBestDist.textContent = msg.best_cost != null
+          ? msg.best_cost.toFixed(1) : '—';
+      }
+      break;
+
+    case 'train_done':
+      if (btnTrainFast) {
+        btnTrainFast.disabled    = false;
+        btnTrainFast.textContent = '⚡ Train DDPG (Fast)';
+      }
+      break;
+
+    case 'test_progress':
+      if (btnRunTestSuite) {
+        btnRunTestSuite.textContent = `Đang đánh giá... ${Math.round(msg.pct ?? 0)}%`;
+      }
+      break;
+
+    case 'test_results':
+      if (btnRunTestSuite) {
+        btnRunTestSuite.disabled    = false;
+        btnRunTestSuite.textContent = '📊 Run Test Suite';
+      }
+      showTestResults(msg.results || []);
+      break;
+
+    case 'model_export': {
+      // Download .pt file
+      const bytes  = atob(msg.data);
+      const ab     = new ArrayBuffer(bytes.length);
+      const view   = new Uint8Array(ab);
+      for (let i = 0; i < bytes.length; i++) view[i] = bytes.charCodeAt(i);
+      const blob   = new Blob([ab], { type: 'application/octet-stream' });
+      const url    = URL.createObjectURL(blob);
+      const a      = document.createElement('a');
+      a.href       = url;
+      a.download   = msg.filename || 'smartroute_ddpg.pt';
+      a.click();
+      URL.revokeObjectURL(url);
+      break;
     }
-  } catch (err) {
-    console.error("[runGeneration] Error:", err);
-  } finally {
-    isProcessingGen = false;
   }
 }
 
-// ─────────────────────────────────────────────
-// Q-LEARNING LOOP (giữ nguyên logic gốc)
-// ─────────────────────────────────────────────
-function runGenerationQL() {
-  let qResult;
-  if (generation === 0) {
-    qResult = { action: 0, params: ACTION_PARAMS[0], state: STATES.IMPROVING, reward: 0, epsilon: qlAgent.epsilon };
-  } else {
-    qResult = qlAgent.step(bestCost);
-    aco.setParams(qResult.params.alpha, qResult.params.rho);
-    if (qResult.action === 1 && qResult.state === STATES.DEGRADED) {
-      graph.resetPheromones();
-    }
-  }
-
-  const { bestPath: roundBest, bestCost: roundCost } = aco.runIteration();
-
-  if (roundBest && roundCost < bestCost) {
-    bestCost = roundCost;
-    bestPath = roundBest;
-  }
-  generation++;
-
-  if (generation % PARTICLE_RATE === 0) renderer.spawnAntParticles(graph, bestPath);
-
-  const displayDist = bestPath ? graph.pathDistance(bestPath) : 0;
-  chartMgr.addDataPoint(generation, displayDist || bestCost, qResult.reward);
-  renderer.render(graph, bestPath, { generation, bestCost: displayDist || bestCost });
-  updateUIQL(qResult);
-}
-
-// ─────────────────────────────────────────────
-// DDPG LOOP
-// ─────────────────────────────────────────────
-async function runGenerationDDPG() {
-  if (!ddpgAgent || !env) return;
-
-  // 1. Lấy state
-  const state = env.getState();
-
-  // 2. Actor chọn action liên tục
-  const { rawAction, alpha, rho } = ddpgAgent.selectAction(state);
-
-  // 3. Áp dụng tham số vào ACO
-  aco.setParams(alpha, rho);
-  if (env.stuckCounter >= 12) graph.resetPheromones(); // Nếu kẹt lâu, reset phero
-
-  // 4. Chạy 1 iteration ACO
-  const { bestPath: roundBest, bestCost: roundCost } = aco.runIteration();
-
-  if (roundBest && roundCost < bestCost) {
-    bestCost = roundCost;
-    bestPath = roundBest;
-  }
-  generation++;
-
-  // 5. Tính reward và next state từ environment
-  const { reward, nextState } = env.step(roundCost, alpha, rho);
-
-  // 7. Lưu transition
-  ddpgAgent.remember(state, rawAction, reward, nextState);
-
-  // 8. Train mỗi 2 generation
-  let trainInfo = null;
-  genSinceLastTrain++;
-  if (genSinceLastTrain >= 2) {
-    genSinceLastTrain = 0;
-    trainInfo = await ddpgAgent.train();
-  }
-
-  // 9. Render + UI
-  if (generation % PARTICLE_RATE === 0) renderer.spawnAntParticles(graph, bestPath);
-
-  const displayDist = bestPath ? graph.pathDistance(bestPath) : 0;
-  chartMgr.addDataPoint(generation, displayDist || bestCost, reward);
-  renderer.render(graph, bestPath, { generation, bestCost: displayDist || bestCost });
-  updateUIDDPG({ alpha, rho, reward, trainInfo, stateVec: nextState });
+// =====================================================================
+// RENDER
+// =====================================================================
+function renderFrame() {
+  if (!renderer || !vGraph || vGraph.size === 0) return;
+  renderer.render(vGraph, bestPath, { generation, bestCost: bestCost ?? 0 });
 }
 
 // =====================================================================
-// LOOP CONTROL
+// UI UPDATE — Q-Learning
 // =====================================================================
-function startLoop() {
-  if (loopHandle) clearInterval(loopHandle);
-  loopHandle = setInterval(runGeneration, MS_PER_GEN);
-}
-function stopLoop() {
-  if (loopHandle) { clearInterval(loopHandle); loopHandle = null; }
-}
+function updateUIQL(ql) {
+  const STATE_CLASSES = { 0: 'state-ok', 1: 'state-stuck', 2: 'state-alert' };
 
-// =====================================================================
-// MODE SWITCHING
-// =====================================================================
-async function switchMode(newMode) {
-  stopLoop();
-  isRunning = false;
-  btnStartPause.textContent = '▶ Bắt đầu';
-  btnStartPause.classList.remove('btn-pause');
-
-  mode = newMode;
-
-  if (newMode === 'ddpg') {
-    // Khởi tạo DDPG agent nếu chưa có
-    if (!ddpgAgent) {
-      showToast('⏳ Đang khởi tạo mạng DDPG...');
-      ddpgAgent = new DDPGAgent();
-      await ddpgAgent.build();
-    }
-    env = new TSPEnvironment(graph, aco);
-    env.reset();
-    ddpgAgent.resetNoise();
-    genSinceLastTrain = 0;
-
-    // Show DDPG panel, hide QL panel
-    if (qlPanel)   qlPanel.classList.add('panel-hidden');
-    if (ddpgPanel) ddpgPanel.classList.remove('panel-hidden');
-    if (elAlgoLabel) elAlgoLabel.textContent = 'ACO + DDPG';
-    btnModeSwitch.classList.remove('mode-ql');
-    btnModeSwitch.classList.add('mode-ddpg');
-    btnModeSwitch.querySelector('.mode-label').textContent = 'DDPG';
-    btnModeSwitch.querySelector('.mode-arrow').textContent = '→ Q-Learning';
-    showToast('✅ Đã chuyển sang DDPG Mode');
-
-  } else {
-    // QL mode
-    qlAgent = new QLearningAgent();
-
-    if (qlPanel)   qlPanel.classList.remove('panel-hidden');
-    if (ddpgPanel) ddpgPanel.classList.add('panel-hidden');
-    if (elAlgoLabel) elAlgoLabel.textContent = 'ACO + Q-Learning';
-    btnModeSwitch.classList.remove('mode-ddpg');
-    btnModeSwitch.classList.add('mode-ql');
-    btnModeSwitch.querySelector('.mode-label').textContent = 'Q-Learning';
-    btnModeSwitch.querySelector('.mode-arrow').textContent = '→ DDPG';
-    showToast('✅ Đã chuyển về Q-Learning Mode');
-  }
-
-  // Reset simulation state nhưng GIỮ graph
-  generation = 0;
-  bestPath   = null;
-  bestCost   = Infinity;
-  chartMgr.reset();
-
-  renderer.render(graph, bestPath, { generation, bestCost: 0 });
-
-  if (elGenNum)   elGenNum.textContent  = '0';
-  if (elBestDist) elBestDist.textContent = '—';
-}
-
-// =====================================================================
-// UI UPDATE — Q-LEARNING
-// =====================================================================
-function updateUIQL(qResult) {
-  const { state, action, params, reward, epsilon } = qResult;
-
-  if (elStateLabel) elStateLabel.textContent = STATE_LABELS[state] ?? 'BÌNH THƯỜNG';
+  if (elStateLabel) elStateLabel.textContent = ql.state_label ?? 'BÌNH THƯỜNG';
   if (elStateBadge) {
-    elStateBadge.className = 'state-badge';
-    if      (state === STATES.IMPROVING) elStateBadge.classList.add('state-ok');
-    else if (state === STATES.STUCK)     elStateBadge.classList.add('state-stuck');
-    else                                 elStateBadge.classList.add('state-alert');
+    elStateBadge.className = `state-badge ${STATE_CLASSES[ql.state] ?? 'state-ok'}`;
   }
-
-  if (elAlpha)   elAlpha.textContent   = params.alpha.toFixed(2);
-  if (elRho)     elRho.textContent     = params.rho.toFixed(2);
-  if (elEpsilon) elEpsilon.textContent = (epsilon ?? qlAgent.epsilon).toFixed(3);
+  if (elAlpha)   elAlpha.textContent   = (ql.alpha   ?? 1).toFixed(2);
+  if (elRho)     elRho.textContent     = (ql.rho     ?? 0.1).toFixed(2);
+  if (elEpsilon) elEpsilon.textContent = (ql.epsilon ?? 0.2).toFixed(3);
   if (elGenNum)  elGenNum.textContent  = generation;
 
-  const displayDist = bestPath ? graph.pathDistance(bestPath) : 0;
-  if (elBestDist) {
-    elBestDist.textContent = displayDist > 0
-      ? displayDist.toFixed(1)
-      : (bestCost < Infinity ? bestCost.toFixed(1) : '—');
-  }
+  updateBestDistUI();
 
-  if (elAction) elAction.textContent = params.label ?? '—';
+  if (elAction) elAction.textContent = ql.action_label ?? '—';
   if (elReward) {
-    elReward.textContent = reward >= 0 ? `+${reward}` : `${reward}`;
-    elReward.className = 'value ' + (reward > 0 ? 'reward-pos' : (reward < 0 ? 'reward-neg' : ''));
+    const r = ql.reward ?? 0;
+    elReward.textContent = r >= 0 ? `+${r}` : `${r}`;
+    elReward.className   = 'value ' + (r > 0 ? 'reward-pos' : r < 0 ? 'reward-neg' : '');
   }
 
-  renderQTable();
+  renderQTable(ql);
 }
 
-function renderQTable() {
-  if (!elQTable || !qlAgent) return;
+function renderQTable(ql) {
+  if (!elQTable || !ql.q_table) return;
   const stateNames  = ['S0', 'S1', 'S2'];
   const actionNames = ['A0', 'A1', 'A2'];
 
@@ -371,15 +294,15 @@ function renderQTable() {
   html += '</tr></thead><tbody>';
 
   for (let s = 0; s < 3; s++) {
-    const isCurrent = s === qlAgent.currentState;
+    const isCurrent = s === ql.state;
     html += `<tr class="${isCurrent ? 'row-active' : ''}"><td class="qtable-state">${stateNames[s]}</td>`;
-    const maxQ = Math.max(...qlAgent.qTable[s]);
+    const row = ql.q_table[s];
+    const maxQ = Math.max(...row);
     for (let a = 0; a < 3; a++) {
-      const q = qlAgent.qTable[s][a];
-      const isBest = (Math.abs(q - maxQ) < 0.001) && isCurrent;
-      const intensity = Math.min(1, Math.max(0, (q - 0) / 20));
-      const color = `rgba(74,158,255,${intensity * 0.5})`;
-      html += `<td class="qtable-cell ${isBest ? 'q-best' : ''}" style="background:${color}">${q.toFixed(1)}</td>`;
+      const q      = row[a];
+      const isBest = Math.abs(q - maxQ) < 0.001 && isCurrent;
+      const intens = Math.min(1, Math.max(0, q / 20));
+      html += `<td class="qtable-cell ${isBest ? 'q-best' : ''}" style="background:rgba(74,158,255,${intens*0.5})">${q.toFixed(1)}</td>`;
     }
     html += '</tr>';
   }
@@ -390,92 +313,199 @@ function renderQTable() {
 // =====================================================================
 // UI UPDATE — DDPG
 // =====================================================================
-function updateUIDDPG({ alpha, rho, reward, trainInfo, stateVec }) {
-  const { ALPHA_MIN, ALPHA_MAX, RHO_MIN, RHO_MAX } = { ALPHA_MIN: 0.3, ALPHA_MAX: 2.5, RHO_MIN: 0.02, RHO_MAX: 0.9 };
+function updateUIDDPG(ddpg) {
+  const ALPHA_MIN = 0.3, ALPHA_MAX = 2.5;
+  const RHO_MIN   = 0.02, RHO_MAX  = 0.9;
 
-  // Gauge alpha
+  const alpha = ddpg.alpha ?? 1.0;
+  const rho   = ddpg.rho   ?? 0.1;
+
+  // Gauges
   const alphaPct = ((alpha - ALPHA_MIN) / (ALPHA_MAX - ALPHA_MIN) * 100).toFixed(1);
+  const rhoPct   = ((rho   - RHO_MIN)   / (RHO_MAX   - RHO_MIN)   * 100).toFixed(1);
   if (elGaugeAlpha) elGaugeAlpha.style.width = `${alphaPct}%`;
   if (elValAlpha)   elValAlpha.textContent   = alpha.toFixed(3);
-
-  // Gauge rho
-  const rhoPct = ((rho - RHO_MIN) / (RHO_MAX - RHO_MIN) * 100).toFixed(1);
-  if (elGaugeRho) elGaugeRho.style.width = `${rhoPct}%`;
-  if (elValRho)   elValRho.textContent   = rho.toFixed(3);
+  if (elGaugeRho)   elGaugeRho.style.width   = `${rhoPct}%`;
+  if (elValRho)     elValRho.textContent     = rho.toFixed(3);
 
   // Training stats
-  if (elCriticLoss) {
-    elCriticLoss.textContent = trainInfo?.criticLoss != null
-      ? trainInfo.criticLoss.toFixed(4) : '—';
-  }
-  if (elActorLoss) {
-    elActorLoss.textContent = trainInfo?.actorLoss != null
-      ? trainInfo.actorLoss.toFixed(4) : '—';
-  }
-  if (elBufferFill && ddpgAgent) {
-    const bs = ddpgAgent.bufferSize;
+  if (elCriticLoss) elCriticLoss.textContent = ddpg.critic_loss != null ? ddpg.critic_loss.toFixed(4) : '—';
+  if (elActorLoss)  elActorLoss.textContent  = ddpg.actor_loss  != null ? ddpg.actor_loss.toFixed(4)  : '—';
+  if (elBufferFill) {
+    const bs = ddpg.buffer_size ?? 0;
     elBufferFill.textContent = `${bs}/5000`;
-    elBufferFill.className = bs >= 200 ? 'value reward-pos' : 'value';
+    elBufferFill.className   = bs >= 200 ? 'value reward-pos' : 'value';
   }
-  if (elOuNoise && ddpgAgent) {
-    elOuNoise.textContent = ddpgAgent.noiseLevel.toFixed(3);
-  }
+  if (elOuNoise)    elOuNoise.textContent = (ddpg.noise_level ?? 0.3).toFixed(3);
   if (elDdpgReward) {
-    elDdpgReward.textContent = reward >= 0 ? `+${reward}` : `${reward}`;
-    elDdpgReward.className = 'value ' + (reward > 0 ? 'reward-pos' : (reward < 0 ? 'reward-neg' : ''));
+    const r = ddpg.reward ?? 0;
+    elDdpgReward.textContent = r >= 0 ? `+${r}` : `${r}`;
+    elDdpgReward.className   = 'value ' + (r > 0 ? 'reward-pos' : r < 0 ? 'reward-neg' : '');
   }
 
   // Shared
-  if (elAlpha)   elAlpha.textContent  = alpha.toFixed(3);
-  if (elRho)     elRho.textContent    = rho.toFixed(3);
-  if (elEpsilon) elEpsilon.textContent = ddpgAgent ? ddpgAgent.noiseLevel.toFixed(3) : '—';
-  if (elGenNum)  elGenNum.textContent = generation;
+  if (elAlpha)   elAlpha.textContent   = alpha.toFixed(3);
+  if (elRho)     elRho.textContent     = rho.toFixed(3);
+  if (elEpsilon) elEpsilon.textContent = (ddpg.noise_level ?? 0.3).toFixed(3);
+  if (elGenNum)  elGenNum.textContent  = generation;
 
-  const displayDist = bestPath ? graph.pathDistance(bestPath) : 0;
-  if (elBestDist) {
-    elBestDist.textContent = displayDist > 0
-      ? displayDist.toFixed(1)
-      : (bestCost < Infinity ? bestCost.toFixed(1) : '—');
-  }
+  updateBestDistUI();
 
-  // State vector mini bars
-  if (elStateVec && stateVec) {
-    renderStateVector(stateVec);
-  }
+  if (elStateVec && ddpg.state_vec) renderStateVector(ddpg.state_vec);
 }
 
-function renderStateVector(stateVec) {
+function renderStateVector(sv) {
   if (!elStateVec) return;
   let html = '';
-  for (let i = 0; i < stateVec.length; i++) {
-    const val = stateVec[i];
-    const pct = (Math.min(1, Math.max(0, val)) * 100).toFixed(1);
-    const color = val > 0.7 ? '#ff6b6b' : val > 0.4 ? '#ffd700' : '#4a9eff';
-    html += `
-      <div class="sv-cell">
-        <div class="sv-label">${STATE_FEATURE_LABELS[i]}</div>
-        <div class="sv-bar-track">
-          <div class="sv-bar-fill" style="width:${pct}%;background:${color}"></div>
-        </div>
-        <div class="sv-val">${val.toFixed(2)}</div>
-      </div>`;
+  for (let i = 0; i < sv.length; i++) {
+    const v   = sv[i];
+    const pct = (Math.min(1, Math.max(0, v)) * 100).toFixed(1);
+    const col = v > 0.7 ? '#ff6b6b' : v > 0.4 ? '#ffd700' : '#4a9eff';
+    html += `<div class="sv-cell">
+      <div class="sv-label">${STATE_FEATURE_LABELS[i]}</div>
+      <div class="sv-bar-track"><div class="sv-bar-fill" style="width:${pct}%;background:${col}"></div></div>
+      <div class="sv-val">${v.toFixed(2)}</div>
+    </div>`;
   }
   elStateVec.innerHTML = html;
 }
 
+function updateBestDistUI() {
+  if (elBestDist) {
+    if (bestCost != null && bestCost < 1e9) {
+      elBestDist.textContent = bestCost.toFixed(1);
+    } else {
+      elBestDist.textContent = '—';
+    }
+  }
+}
+
 // =====================================================================
-// EVENT HANDLERS
+// MODE UI
+// =====================================================================
+function applyModeUI(newMode) {
+  mode = newMode;
+  if (newMode === 'ddpg') {
+    if (qlPanel)   qlPanel.classList.add('panel-hidden');
+    if (ddpgPanel) ddpgPanel.classList.remove('panel-hidden');
+    if (elAlgoLabel) elAlgoLabel.textContent = 'ACO + DDPG';
+    btnModeSwitch.classList.remove('mode-ql');
+    btnModeSwitch.classList.add('mode-ddpg');
+    btnModeSwitch.querySelector('.mode-label').textContent = 'DDPG';
+    btnModeSwitch.querySelector('.mode-arrow').textContent = '→ Q-Learning';
+  } else {
+    if (qlPanel)   qlPanel.classList.remove('panel-hidden');
+    if (ddpgPanel) ddpgPanel.classList.add('panel-hidden');
+    if (elAlgoLabel) elAlgoLabel.textContent = 'ACO + Q-Learning';
+    btnModeSwitch.classList.remove('mode-ddpg');
+    btnModeSwitch.classList.add('mode-ql');
+    btnModeSwitch.querySelector('.mode-label').textContent = 'Q-Learning';
+    btnModeSwitch.querySelector('.mode-arrow').textContent = '→ DDPG';
+  }
+}
+
+// =====================================================================
+// TEST RESULTS MODAL
+// =====================================================================
+function showTestResults(results) {
+  testModal.classList.remove('hidden');
+  testTableBody.innerHTML = '';
+
+  const labels = [], qlData = [], ddpgData = [];
+
+  for (const r of results) {
+    labels.push(r.id);
+    const qlErr   = ((r.ql.best_cost   - r.optimal) / r.optimal * 100);
+    const ddpgErr = ((r.ddpg.best_cost - r.optimal) / r.optimal * 100);
+    qlData.push(qlErr);
+    ddpgData.push(ddpgErr);
+
+    const qlErrStr   = qlErr   < 0.1 ? 'Optimal' : `+${qlErr.toFixed(2)}%`;
+    const ddpgErrStr = ddpgErr < 0.1 ? 'Optimal' : `+${ddpgErr.toFixed(2)}%`;
+
+    testTableBody.insertAdjacentHTML('beforeend', `
+      <tr>
+        <td>${r.name}</td>
+        <td class="td-optimal">${r.optimal.toFixed(1)}</td>
+        <td>${r.ql.best_cost.toFixed(1)}</td>
+        <td class="${qlErr < 0.1 ? 'td-perfect' : 'td-error'}">${qlErrStr}</td>
+        <td>${r.ddpg.best_cost.toFixed(1)}</td>
+        <td class="${ddpgErr < 0.1 ? 'td-perfect' : 'td-error'}">${ddpgErrStr}</td>
+      </tr>`);
+  }
+
+  const ctx = document.getElementById('test-compare-chart').getContext('2d');
+  if (testCompareChart) testCompareChart.destroy();
+  testCompareChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'QL-ACO Error %',  data: qlData,   backgroundColor: 'rgba(74,158,255,0.7)' },
+        { label: 'DDPG Error %',    data: ddpgData,  backgroundColor: 'rgba(167,139,250,0.7)' },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: { y: { beginAtZero: true, title: { display: true, text: 'Error (%) vs Optimal' } } },
+    },
+  });
+}
+
+// =====================================================================
+// CANVAS INTERACTION
+// =====================================================================
+function resizeCanvas() {
+  const container = document.getElementById('canvas-container');
+  if (!container) return;
+  mainCanvas.width  = container.clientWidth;
+  mainCanvas.height = container.clientHeight;
+}
+
+mainCanvas.addEventListener('click', (e) => {
+  if (!isBlockTool || !vGraph || vGraph.size === 0) return;
+  const rect = mainCanvas.getBoundingClientRect();
+  const mx   = (e.clientX - rect.left) * (mainCanvas.width / rect.width);
+  const my   = (e.clientY - rect.top)  * (mainCanvas.height / rect.height);
+
+  const edge = renderer.findNearestEdge(vGraph, mx, my, 18);
+  if (edge) {
+    send({ type: 'block_edge', i: edge.i, j: edge.j });
+  }
+});
+
+mainCanvas.addEventListener('mousemove', (e) => {
+  if (!vGraph || !renderer) return;
+  const rect = mainCanvas.getBoundingClientRect();
+  const mx   = (e.clientX - rect.left) * (mainCanvas.width / rect.width);
+  const my   = (e.clientY - rect.top)  * (mainCanvas.height / rect.height);
+  if (isBlockTool) {
+    const edge = renderer.findNearestEdge(vGraph, mx, my, 15);
+    mainCanvas.style.cursor = edge ? 'crosshair' : 'default';
+  } else {
+    mainCanvas.style.cursor = 'default';
+  }
+});
+
+window.addEventListener('resize', () => {
+  resizeCanvas();
+  renderFrame();
+});
+
+// =====================================================================
+// BUTTON HANDLERS
 // =====================================================================
 btnStartPause.addEventListener('click', () => {
   isRunning = !isRunning;
   if (isRunning) {
     btnStartPause.textContent = '⏸ Tạm dừng';
     btnStartPause.classList.add('btn-pause');
-    startLoop();
+    send({ type: 'start' });
   } else {
     btnStartPause.textContent = '▶ Bắt đầu';
     btnStartPause.classList.remove('btn-pause');
-    stopLoop();
+    send({ type: 'pause' });
   }
 });
 
@@ -485,256 +515,84 @@ btnBlockTool.addEventListener('click', () => {
 });
 
 if (btnClearTraffic) {
-  btnClearTraffic.addEventListener('click', () => {
-    if (!graph) return;
-    graph.clearAllBlockedEdges();
-    if (mode === 'ql' && qlAgent) {
-      qlAgent.triggerTrafficEvent(); // Reset baseline
-    } else if (mode === 'ddpg' && env) {
-      env.triggerTrafficEvent(); // Reset baseline
-    }
-    // Cần reset lại bestCost hiển thị
-    bestCost = Infinity;
-    showToast('Đã gỡ bỏ toàn bộ tắc đường!');
-    renderer.render(graph, bestPath, { generation, bestCost });
-  });
+  btnClearTraffic.addEventListener('click', () => send({ type: 'clear_traffic' }));
 }
 
 btnReset.addEventListener('click', () => {
-  stopLoop();
-  isRunning = false;
+  isRunning   = false;
   isBlockTool = false;
   btnStartPause.textContent = '▶ Bắt đầu';
   btnStartPause.classList.remove('btn-pause');
   setBlockToolActive(false);
-  init();
+  send({ type: 'reset' });
 });
 
-btnModeSwitch.addEventListener('click', async () => {
+btnModeSwitch.addEventListener('click', () => {
   const next = mode === 'ql' ? 'ddpg' : 'ql';
-  await switchMode(next);
+  isRunning   = false;
+  btnStartPause.textContent = '▶ Bắt đầu';
+  btnStartPause.classList.remove('btn-pause');
+  send({ type: 'switch_mode', mode: next });
 });
 
-// =====================================================================
-// NEW ACTIONS: HEADLESS TRAIN & TEST SUITE
-// =====================================================================
-
-// 1. Train Fast (Headless)
 if (btnTrainFast) {
-  btnTrainFast.addEventListener('click', async () => {
-    if (mode !== 'ddpg') {
-      showToast('Chỉ có thể Train ở chế độ DDPG!');
-      return;
-    }
-    stopLoop();
-    btnStartPause.textContent = '▶ Bắt đầu';
+  btnTrainFast.addEventListener('click', () => {
     isRunning = false;
-    
-    showToast('Đang khởi động Headless Trainer...');
-    const trainer = new HeadlessTrainer(graph, ddpgAgent);
-    
-    btnTrainFast.disabled = true;
-    btnTrainFast.textContent = 'Đang train... (Xem log)';
-    
-    await trainer.train(2000, (gen, bCost, aLoss, noise) => {
-      // Cập nhật UI nhẹ nhàng để không đơ
-      if (elGenNum) elGenNum.textContent = gen;
-      if (elBestDist) elBestDist.textContent = bCost.toFixed(1);
-    });
-    
-    showToast('Train hoàn tất!');
-    btnTrainFast.disabled = false;
-    btnTrainFast.textContent = '⚡ Train DDPG (Fast)';
-    
-    // Gắn state mới nhất lên bảng hiển thị
-    chartMgr.addDataPoint(2000, bestCost, 0);
+    btnStartPause.textContent = '▶ Bắt đầu';
+    btnStartPause.classList.remove('btn-pause');
+    send({ type: 'train_fast' });
   });
 }
 
-// 2. Export / Import Model
 if (btnExportModel) {
-  btnExportModel.addEventListener('click', async () => {
-    if (mode === 'ddpg' && ddpgAgent) {
-      showToast('Đang xuất mô hình...');
-      await ddpgAgent.exportWeights();
-      showToast('Đã tải xuống json và bin!');
-    }
-  });
+  btnExportModel.addEventListener('click', () => send({ type: 'export_model' }));
 }
 
 if (btnImportModel) {
   btnImportModel.addEventListener('click', () => {
-    fileImportJson.click();
-  });
-}
-if (fileImportJson) {
-  fileImportJson.addEventListener('change', (e) => {
-    if (!e.target.files.length) return;
-    // Bắt user chọn nốt file bin
-    showToast('Vui lòng chọn tiếp file .bin');
-    fileImportBin.click();
-  });
-}
-if (fileImportBin) {
-  fileImportBin.addEventListener('change', async (e) => {
-    if (!e.target.files.length || !fileImportJson.files.length) return;
-    
-    if (mode === 'ddpg' && ddpgAgent) {
-      showToast('Đang tải mô hình...');
-      const success = await ddpgAgent.importWeights(fileImportJson.files[0], fileImportBin.files[0]);
-      if (success) showToast('Tải mô hình thành công!');
-      else showToast('Lỗi tải mô hình!');
-    }
+    if (fileImportPt) fileImportPt.click();
   });
 }
 
-// 3. Test Suite
+if (fileImportPt) {
+  fileImportPt.addEventListener('change', async (e) => {
+    if (!e.target.files.length) return;
+    const file   = e.target.files[0];
+    const buffer = await file.arrayBuffer();
+    const bytes  = new Uint8Array(buffer);
+    // Convert to base64
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    const b64  = btoa(binary);
+    send({ type: 'import_model', data: b64 });
+    e.target.value = '';
+  });
+}
+
 if (btnRunTestSuite) {
-  btnRunTestSuite.addEventListener('click', async () => {
-    if (!ddpgAgent) return;
-    stopLoop();
+  btnRunTestSuite.addEventListener('click', () => {
     isRunning = false;
     btnStartPause.textContent = '▶ Bắt đầu';
-    
-    showToast('Đang chạy Test Suite... Vui lòng đợi.');
-    btnRunTestSuite.disabled = true;
+    btnStartPause.classList.remove('btn-pause');
+    btnRunTestSuite.disabled    = true;
     btnRunTestSuite.textContent = 'Đang đánh giá...';
-    
-    const evaluator = new Evaluator();
-    const results = await evaluator.runTestSuite(ddpgAgent, (msg, pct) => {
-      btnRunTestSuite.textContent = `Đang đánh giá... ${Math.round(pct)}%`;
-    });
-    
-    btnRunTestSuite.disabled = false;
-    btnRunTestSuite.textContent = '📊 Run Test Suite';
-    
-    showTestResults(results);
+    send({ type: 'run_test_suite' });
   });
 }
 
 if (btnCloseModal) {
-  btnCloseModal.addEventListener('click', () => {
-    testModal.classList.add('hidden');
-  });
+  btnCloseModal.addEventListener('click', () => testModal.classList.add('hidden'));
 }
-
-function showTestResults(results) {
-  testModal.classList.remove('hidden');
-  testTableBody.innerHTML = '';
-  
-  const labels = [];
-  const qlData = [];
-  const ddpgData = [];
-
-  for (const r of results) {
-    labels.push(r.id);
-    
-    const qlErr = ((r.ql.bestCost - r.optimal) / r.optimal * 100);
-    const ddpgErr = ((r.ddpg.bestCost - r.optimal) / r.optimal * 100);
-    
-    qlData.push(qlErr);
-    ddpgData.push(ddpgErr);
-
-    const qlErrStr = qlErr < 0.1 ? 'Optimal' : `+${qlErr.toFixed(2)}%`;
-    const ddpgErrStr = ddpgErr < 0.1 ? 'Optimal' : `+${ddpgErr.toFixed(2)}%`;
-    
-    const html = `
-      <tr>
-        <td>${r.name}</td>
-        <td class="td-optimal">${r.optimal.toFixed(1)}</td>
-        <td>${r.ql.bestCost.toFixed(1)}</td>
-        <td class="${qlErr < 0.1 ? 'td-perfect' : 'td-error'}">${qlErrStr}</td>
-        <td>${r.ddpg.bestCost.toFixed(1)}</td>
-        <td class="${ddpgErr < 0.1 ? 'td-perfect' : 'td-error'}">${ddpgErrStr}</td>
-      </tr>
-    `;
-    testTableBody.insertAdjacentHTML('beforeend', html);
-  }
-  
-  // Render Chart
-  const ctx = document.getElementById('test-compare-chart').getContext('2d');
-  if (testCompareChart) testCompareChart.destroy();
-  
-  testCompareChart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: labels,
-      datasets: [
-        {
-          label: 'QL-ACO Error %',
-          data: qlData,
-          backgroundColor: 'rgba(74,158,255,0.7)',
-        },
-        {
-          label: 'DDPG Error %',
-          data: ddpgData,
-          backgroundColor: 'rgba(167,139,250,0.7)',
-        }
-      ]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      scales: {
-        y: { beginAtZero: true, title: { display: true, text: 'Error (%) vs Optimal' } }
-      }
-    }
-  });
-}
-
-// Canvas click — tắc đường
-mainCanvas.addEventListener('click', (e) => {
-  if (!isBlockTool || !graph) return;
-  const rect = mainCanvas.getBoundingClientRect();
-  const mx = (e.clientX - rect.left) * (mainCanvas.width / rect.width);
-  const my = (e.clientY - rect.top)  * (mainCanvas.height / rect.height);
-
-  const edge = renderer.findNearestEdge(graph, mx, my, 18);
-  if (edge) {
-    const blocked = graph.blockEdge(edge.i, edge.j);
-    if (blocked) {
-      if (mode === 'ql') {
-        qlAgent.triggerTrafficEvent();
-      } else if (env) {
-        env.triggerTrafficEvent();
-      }
-      showToast(`⚠️ Tắc đường: cạnh ${edge.i}↔${edge.j} (×${graph.TRAFFIC_MULTIPLIER})`);
-      if (bestPath) {
-        const affectsPath = bestPath.some((v, k) => {
-          if (k >= bestPath.length - 1) return false;
-          const a = bestPath[k], b = bestPath[k+1];
-          return (a === edge.i && b === edge.j) || (a === edge.j && b === edge.i);
-        });
-        if (affectsPath) bestCost = Infinity;
-      }
-    } else {
-      showToast('Cạnh này đã bị tắc đường rồi!');
-    }
-    renderer.render(graph, bestPath, { generation, bestCost });
-  }
-});
-
-// Canvas hover
-mainCanvas.addEventListener('mousemove', (e) => {
-  if (!graph || !renderer) return;
-  const rect = mainCanvas.getBoundingClientRect();
-  const mx = (e.clientX - rect.left) * (mainCanvas.width / rect.width);
-  const my = (e.clientY - rect.top)  * (mainCanvas.height / rect.height);
-  if (isBlockTool) {
-    const edge = renderer.findNearestEdge(graph, mx, my, 15);
-    mainCanvas.style.cursor = edge ? 'crosshair' : 'default';
-  } else {
-    mainCanvas.style.cursor = 'default';
-  }
-});
 
 // =====================================================================
 // HELPERS
 // =====================================================================
 function setBlockToolActive(active) {
   isBlockTool = active;
-  btnBlockTool.classList.toggle('tool-active', active);
-  btnBlockTool.textContent = active ? '🚫 Đang chọn cạnh...' : '🚧 Tạo Tắc Đường';
+  if (btnBlockTool) {
+    btnBlockTool.classList.toggle('tool-active', active);
+    btnBlockTool.textContent = active ? '🚫 Đang chọn cạnh...' : '🚧 Tạo Tắc Đường';
+  }
   mainCanvas.style.cursor = active ? 'crosshair' : 'default';
 }
 
@@ -746,46 +604,26 @@ function showToast(msg) {
   setTimeout(() => toast.classList.remove('show'), 3000);
 }
 
-function resizeCanvas() {
-  const container = document.getElementById('canvas-container');
-  if (!container) return;
-  mainCanvas.width  = container.clientWidth;
-  mainCanvas.height = container.clientHeight;
-}
-
-window.addEventListener('resize', () => {
-  resizeCanvas();
-  if (graph) {
-    const oldW = graph.canvasWidth, oldH = graph.canvasHeight;
-    graph.canvasWidth  = mainCanvas.width;
-    graph.canvasHeight = mainCanvas.height;
-    const sx = mainCanvas.width / oldW, sy = mainCanvas.height / oldH;
-    for (const node of graph.nodes) { node.x *= sx; node.y *= sy; }
-    graph._computeDistances();
-    renderer.render(graph, bestPath, { generation, bestCost });
-  }
-});
-
 // =====================================================================
 // BOOTSTRAP
 // =====================================================================
 window.addEventListener('DOMContentLoaded', () => {
-  // Bắt đầu với QL mode
-  if (qlPanel)   qlPanel.classList.remove('panel-hidden');
-  if (ddpgPanel) ddpgPanel.classList.add('panel-hidden');
+  resizeCanvas();
 
-  init();
+  renderer = new Renderer(mainCanvas);
+  chartMgr = new ChartManager('line-chart');
+  chartMgr.initialize();
 
-  // Animation loop liên tục ngay cả khi pause
+  // Set initial mode UI
+  applyModeUI('ql');
+
+  // Connect WebSocket
+  connectWS();
+
+  // Animation loop (renders even when paused)
   function animLoop() {
-    if (!isRunning && graph) {
-      renderer.render(graph, bestPath, { generation, bestCost });
-    }
+    renderFrame();
     requestAnimationFrame(animLoop);
   }
   requestAnimationFrame(animLoop);
 });
-
-// Debug object — có thể truy cập qua console
-window.__smartRoute = { getGraph: () => graph, getAco: () => aco, getMode: () => mode,
-  getDdpgAgent: () => ddpgAgent, getEnv: () => env };
